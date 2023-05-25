@@ -12,6 +12,7 @@ use smithay::{
     desktop::{space::SpaceElement, Window},
     output::Output,
     utils::{Logical, Point, Rectangle, Scale, Transform},
+    wayland::{compositor::with_states, shell::xdg::SurfaceCachedState},
 };
 
 use crate::state::CONFIG;
@@ -42,6 +43,7 @@ pub struct Workspace {
     windows: Vec<Rc<RefCell<MagmaWindow>>>,
     outputs: Vec<Output>,
     pub layout_tree: BinaryTree,
+    pub floating: Vec<Rc<RefCell<MagmaWindow>>>,
 }
 
 impl Workspace {
@@ -50,6 +52,7 @@ impl Workspace {
             windows: Vec::new(),
             outputs: Vec::new(),
             layout_tree: BinaryTree::new(),
+            floating: Vec::new(),
         }
     }
 
@@ -67,10 +70,35 @@ impl Workspace {
         // add window to vec and remap if exists
         self.windows
             .retain(|w| w.borrow().window != window.borrow().window);
-        self.windows.push(window.clone());
-        self.layout_tree
-            .insert(window, self.layout_tree.next_split(), 0.5);
-        bsp_update_layout(self);
+        self.windows.insert(0, window.clone());
+        let (max_size, min_size) =
+            with_states(window.borrow().window.toplevel().wl_surface(), |states| {
+                let attr = states.cached_state.current::<SurfaceCachedState>();
+                dbg!(attr.max_size, attr.min_size)
+            });
+        let parent = dbg!(window.borrow().window.toplevel().parent().is_some());
+        if (min_size.w != 0
+            && min_size.h != 0
+            && (min_size.w == max_size.w || min_size.h == max_size.h))
+            || parent
+        {
+            let mw = window.borrow().rec;
+            let os = self
+                .outputs
+                .first()
+                .unwrap()
+                .current_mode()
+                .unwrap()
+                .size
+                .to_logical(1);
+            window.borrow_mut().rec.loc =
+                Point::from((os.w / 2 - mw.size.w / 2, os.h / 2 - mw.size.h / 2));
+            self.floating.push(window);
+        } else {
+            self.layout_tree
+                .insert(window, self.layout_tree.next_split(), 0.5);
+            bsp_update_layout(self);
+        }
     }
 
     pub fn remove_window(&mut self, window: &Window) -> Option<Rc<RefCell<MagmaWindow>>> {
@@ -183,6 +211,7 @@ impl Default for Workspace {
 pub struct Workspaces {
     workspaces: Vec<Workspace>,
     pub current: u8,
+    pub pending: Vec<Window>,
 }
 
 impl Workspaces {
@@ -190,6 +219,7 @@ impl Workspaces {
         Workspaces {
             workspaces: (0..workspaceamount).map(|_| Workspace::new()).collect(),
             current: 0,
+            pending: Vec::new(),
         }
     }
 
