@@ -1,9 +1,9 @@
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
-    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
-    delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_layer_shell,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
     desktop::{layer_map_for_output, LayerSurface},
-    input::{SeatHandler, SeatState},
+    input::{pointer::CursorImageStatus, SeatHandler, SeatState},
     output::Output,
     reexports::wayland_server::{
         protocol::{wl_output::WlOutput, wl_surface::WlSurface},
@@ -31,6 +31,7 @@ use smithay::{
             Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
         },
         shm::{ShmHandler, ShmState},
+        tablet_manager::TabletSeatHandler,
     },
 };
 
@@ -101,8 +102,19 @@ impl<BackendData: Backend> SeatHandler for MagmaState<BackendData> {
     fn cursor_image(
         &mut self,
         _seat: &smithay::input::Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
+        image: smithay::input::pointer::CursorImageStatus,
     ) {
+        if let CursorImageStatus::Named(icon) = image {
+            if !self.xcursor.change_variant(icon.name()) {
+                for name in icon.alt_names() {
+                    if self.xcursor.change_variant(name) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // TODO: Add support for hiding cursors and rendering cursors with wlsurfaces
+        }
     }
     fn focus_changed(&mut self, seat: &smithay::input::Seat<Self>, focused: Option<&FocusTarget>) {
         let dh = &self.dh;
@@ -138,6 +150,10 @@ impl<BackendData: Backend> SeatHandler for MagmaState<BackendData> {
 }
 
 delegate_seat!(@<BackendData: Backend + 'static> MagmaState<BackendData>);
+
+impl<BackendData: Backend> TabletSeatHandler for MagmaState<BackendData> {}
+
+delegate_cursor_shape!(@<BackendData: Backend + 'static> MagmaState<BackendData>);
 
 //
 // Wl Data Device
