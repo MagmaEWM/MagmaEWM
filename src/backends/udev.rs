@@ -66,7 +66,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     delegate_screencopy_manager,
     protocols::screencopy::{frame::Screencopy, ScreencopyHandler, ScreencopyManagerState},
-    state::{Backend, CalloopData, MagmaState, CONFIG},
+    state::{Backend, MagmaState, CONFIG},
     utils::{
         process,
         render::{border::BorderShader, init_shaders, CustomRenderElements},
@@ -143,7 +143,7 @@ pub struct Surface {
 }
 
 pub fn init_udev() {
-    let mut event_loop: EventLoop<CalloopData<UdevData>> = EventLoop::try_new().unwrap();
+    let mut event_loop: EventLoop<MagmaState<UdevData>> = EventLoop::try_new().unwrap();
     let display: Display<MagmaState<UdevData>> = Display::new().unwrap();
     let mut display_handle: DisplayHandle = display.handle().clone();
     /*
@@ -189,10 +189,10 @@ pub fn init_udev() {
 
     event_loop
         .handle()
-        .insert_source(libinput_backend, move |event, _, calloopdata| {
-            if let Some(vt) = calloopdata.state.process_input_event_udev(event) {
+        .insert_source(libinput_backend, move |event, _, state| {
+            if let Some(vt) = state.process_input_event_udev(event) {
                 info!(to = vt, "Trying to switch vt");
-                if let Err(err) = calloopdata.state.backend_data.session.change_vt(vt) {
+                if let Err(err) = state.backend_data.session.change_vt(vt) {
                     error!(vt, "Error switching vt: {}", err);
                 }
             }
@@ -201,13 +201,13 @@ pub fn init_udev() {
 
     event_loop
         .handle()
-        .insert_source(notifier, move |event, _, data| {
+        .insert_source(notifier, move |event, _, state| {
             match event {
                 SessionEvent::PauseSession => {
                     libinput_context.suspend();
                     info!("pausing session");
 
-                    for backend in data.state.backend_data.devices.values_mut() {
+                    for backend in state.backend_data.devices.values_mut() {
                         backend.drm.pause();
                     }
                 }
@@ -217,8 +217,7 @@ pub fn init_udev() {
                     if let Err(err) = libinput_context.resume() {
                         error!("Failed to resume libinput context: {:?}", err);
                     }
-                    for (node, backend) in data
-                        .state
+                    for (node, backend) in state
                         .backend_data
                         .devices
                         .iter_mut()
@@ -239,16 +238,16 @@ pub fn init_udev() {
                             // has no content and damage tracking may prevent a redraw
                             // otherwise
                             surface.compositor.reset_buffers();
-                            data.state.loop_handle.insert_idle(move |data| {
+                            state.loop_handle.insert_idle(move |state| {
                                 if let Some(SwapBuffersError::ContextLost(_)) =
-                                    data.state.render(node, crtc, None).err()
+                                    state.render(node, crtc, None).err()
                                 {
                                     info!("Context lost on device {}, re-creating", node);
-                                    data.state.on_device_removed(node);
-                                    data.state.on_device_added(
+                                    state.on_device_removed(node);
+                                    state.on_device_added(
                                         node,
                                         node.dev_path().unwrap(),
-                                        &mut data.display_handle,
+                                        &mut state.dh.clone(),
                                     );
                                 }
                             });
@@ -273,13 +272,10 @@ pub fn init_udev() {
             &mut display_handle,
         );
     }
-
     event_loop
         .handle()
-        .insert_source(backend, |event, _, calloopdata| {
-            calloopdata
-                .state
-                .on_udev_event(event, &mut calloopdata.display_handle)
+        .insert_source(backend, |event, _, state| {
+            state.on_udev_event(event, &mut state.dh.clone())
         })
         .unwrap();
 
@@ -309,36 +305,31 @@ pub fn init_udev() {
     );
     state.backend_data.dmabuf_state = Some((dmabuf_state, global));
 
-    let mut calloopdata = CalloopData {
-        state,
-        display_handle,
-    };
+    #[cfg(feature = "xwayland")]
+    state.xwayland_state.start(event_loop.handle());
 
-    std::env::set_var("WAYLAND_DISPLAY", &calloopdata.state.socket_name);
+    std::env::set_var("WAYLAND_DISPLAY", &state.socket_name);
 
     for command in &CONFIG.autostart {
         process::spawn(command);
     }
 
     event_loop
-        .run(None, &mut calloopdata, move |data| {
-            data.state
-                .workspaces
-                .all_windows()
-                .for_each(|e| e.refresh());
+        .run(None, &mut state, |state| {
+            state.workspaces.all_windows().for_each(|e| e.refresh());
 
-            let output = data.state.workspaces.current().outputs().next().unwrap();
+            let output = state.workspaces.current().outputs().next().unwrap();
             for layer in layer_map_for_output(output).layers() {
                 layer.send_frame(
                     output,
-                    data.state.start_time.elapsed(),
+                    state.start_time.elapsed(),
                     Some(Duration::ZERO),
                     |_, _| Some(output.clone()),
                 );
             }
 
-            data.display_handle.flush_clients().unwrap();
-            data.state.popup_manager.cleanup();
+            display_handle.flush_clients().unwrap();
+            state.popup_manager.cleanup();
         })
         .unwrap();
 }
@@ -427,8 +418,8 @@ impl MagmaState<UdevData> {
 
         let registration_token = self
             .loop_handle
-            .insert_source(drm_notifier, move |event, meta, calloopdata| {
-                calloopdata.state.on_drm_event(node, event, meta);
+            .insert_source(drm_notifier, move |event, meta, state| {
+                state.on_drm_event(node, event, meta);
             })
             .unwrap();
 
@@ -932,8 +923,8 @@ impl MagmaState<UdevData> {
             );
             let timer = Timer::from_duration(reschedule_duration);
             self.loop_handle
-                .insert_source(timer, move |_, _, data| {
-                    data.state.render(node, crtc, None).ok();
+                .insert_source(timer, move |_, _, state| {
+                    state.render(node, crtc, None).ok();
                     TimeoutAction::Drop
                 })
                 .expect("failed to schedule frame timer");

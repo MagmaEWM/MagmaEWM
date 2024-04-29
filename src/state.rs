@@ -2,9 +2,7 @@ use std::{ffi::OsString, sync::Arc, time::Instant};
 
 use once_cell::sync::Lazy;
 use smithay::{
-    desktop::{
-        layer_map_for_output, {PopupManager, Window},
-    },
+    desktop::{layer_map_for_output, PopupManager, Window},
     input::{keyboard::XkbConfig, Seat, SeatState},
     reexports::{
         calloop::{generic::Generic, Interest, LoopHandle, LoopSignal, Mode, PostAction},
@@ -29,15 +27,12 @@ use smithay::{
 use tracing::warn;
 
 use crate::utils::{focus::FocusTarget, workspace::Workspaces};
+#[cfg(feature = "xwayland")]
+use crate::xwayland::XWaylandState;
 use crate::{
     config::{load_config, Config},
     debug::MagmaDebug,
 };
-
-pub struct CalloopData<BackendData: Backend + 'static> {
-    pub state: MagmaState<BackendData>,
-    pub display_handle: DisplayHandle,
-}
 
 pub trait Backend {
     fn seat_name(&self) -> String;
@@ -49,7 +44,7 @@ pub struct MagmaState<BackendData: Backend + 'static> {
     pub dh: DisplayHandle,
     pub backend_data: BackendData,
     pub start_time: Instant,
-    pub loop_handle: LoopHandle<'static, CalloopData<BackendData>>,
+    pub loop_handle: LoopHandle<'static, Self>,
     pub loop_signal: LoopSignal,
 
     // protocol state
@@ -63,6 +58,8 @@ pub struct MagmaState<BackendData: Backend + 'static> {
     pub seat_state: SeatState<MagmaState<BackendData>>,
     pub layer_shell_state: WlrLayerShellState,
     pub popup_manager: PopupManager,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_state: XWaylandState,
 
     pub seat: Seat<Self>,
     pub seat_name: String,
@@ -77,7 +74,7 @@ pub struct MagmaState<BackendData: Backend + 'static> {
 
 impl<BackendData: Backend + 'static> MagmaState<BackendData> {
     pub fn new(
-        loop_handle: LoopHandle<'static, CalloopData<BackendData>>,
+        loop_handle: LoopHandle<'static, Self>,
         loop_signal: LoopSignal,
         display: Display<MagmaState<BackendData>>,
         backend_data: BackendData,
@@ -124,7 +121,7 @@ impl<BackendData: Backend + 'static> MagmaState<BackendData> {
                 //
                 // You may also associate some data with the client when inserting the client.
                 state
-                    .display_handle
+                    .dh
                     .insert_client(client_stream, Arc::new(ClientState::default()))
                     .unwrap();
             })
@@ -135,16 +132,22 @@ impl<BackendData: Backend + 'static> MagmaState<BackendData> {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
-                    unsafe {
-                        display
-                            .get_mut()
-                            .dispatch_clients(&mut state.state)
-                            .unwrap()
-                    };
+                    unsafe { display.get_mut().dispatch_clients(state).unwrap() };
                     Ok(PostAction::Continue)
                 },
             )
             .expect("Failed to init wayland server source");
+
+        #[cfg(feature = "xwayland")]
+        let (xwayland_state, xwayland_source) = XWaylandState::new(&dh);
+        #[cfg(feature = "xwayland")]
+        loop_handle
+            .insert_source(xwayland_source, |event, _, state| {
+                state
+                    .xwayland_state
+                    .on_event(event, state.loop_handle.clone(), &mut state.dh);
+            })
+            .unwrap();
 
         Self {
             loop_handle,
@@ -164,6 +167,8 @@ impl<BackendData: Backend + 'static> MagmaState<BackendData> {
             data_device_state,
             primary_selection_state,
             layer_shell_state,
+            #[cfg(feature = "xwayland")]
+            xwayland_state,
             seat,
             workspaces,
             pointer_location: Point::from((0.0, 0.0)),
